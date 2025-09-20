@@ -97,9 +97,9 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
         srcHeight: image.height,
         smallW: 160,
         smallH: 90,
-        alphaBg: 0.10,           // Moderate background learning
-        alphaFg: 0.01,           // Slower where foreground detected
-        baseThresh: 27,          // Lower base threshold for sensitivity
+        alphaBg: 0.25,           // Moderate background learning
+        alphaFg: 0.05,           // Slower where foreground detected
+        baseThresh: 30,          // Lower base threshold for sensitivity
         temporalN: 6,            // Shorter temporal window
         temporalVotes: 4,        // Fewer votes required
         minBlobArea: 80,         // Smaller minimum blob
