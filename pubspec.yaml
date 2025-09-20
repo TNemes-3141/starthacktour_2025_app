@@ -38,7 +38,11 @@ dependencies:
   flutter_vision: ^2.0.0
   collection: ^1.18.0
   path_provider: ^2.1.4
-  supabase_flutter: ^2.6.0
+  supabase_flutter: ^2.10.1
+  image: ^4.2.0
+
+dependency_overrides:
+  sign_in_with_apple: ^7.0.1
 
 dev_dependencies:
   flutter_test:

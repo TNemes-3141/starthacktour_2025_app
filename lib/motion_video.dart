@@ -1,11 +1,13 @@
 // lib/motion_video.dart
 import 'dart:async';
-import 'dart:io';
 import 'dart:ui' as ui;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:flutter/rendering.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'dart:typed_data';
+import 'package:image/image.dart' as img;
+import 'snapshot_object_result.dart';
 
 import 'motion_detect.dart';
 import 'sort.dart';
@@ -147,25 +149,133 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
 
       final pixelRatio = MediaQuery.of(context).devicePixelRatio;
       final ui.Image image = await boundary.toImage(pixelRatio: pixelRatio);
-      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-      if (byteData == null) throw Exception('Failed to encode image');
+      final byteData = await image.toByteData(
+        format: ui.ImageByteFormat.rawRgba,
+      );
+      if (byteData == null) throw Exception('Failed to get RGBA data');
 
-      final bytes = byteData.buffer.asUint8List();
-      final dir = await getApplicationDocumentsDirectory();
-      final ts = DateTime.now().toIso8601String().replaceAll(':', '-');
-      final file = File('${dir.path}/snapshot_$ts.png');
-      await file.writeAsBytes(bytes);
+      final rgbaBytes = byteData.buffer.asUint8List();
+      final baseSizeImage = img.Image.fromBytes(
+        width: image.width,
+        height: image.height,
+        bytes: rgbaBytes.buffer,
+        order: img.ChannelOrder.rgba,
+      );
+
+      // Compress to JPG with quality 80
+      final jpgBytes = img.encodeJpg(baseSizeImage, quality: 80);
+
+      print("Uploading snapshot (JPG) to DB...");
+
+      final result = await _uploadSnapshotToSupabase(
+        Uint8List.fromList(jpgBytes),
+      );
 
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Snapshot saved: ${file.path}')));
+      
+      if (result != null) {
+        // 2) Push dummy record into the DB
+        await _insertDummyObjectUpdate(
+          objectId:
+              'dummy-001', // <— for POC; later use your Track.id.toString()
+          snapshotPath: result.objectPath, // stored path in bucket
+          snapshotUrl: result.publicUrl, // public/signed URL
+        );
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Uploaded & recorded to DB')),
+        );
+
+        setState(() {
+          _notificationText = 'Uploaded: ${result.publicUrl}';
+        });
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Upload completed (no URL)')),
+        );
+      }
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('Snapshot failed: $e')));
+      ).showSnackBar(SnackBar(content: Text('Snapshot upload failed: $e')));
     }
+  }
+
+  Future<SnapshotUploadResult?> _uploadSnapshotToSupabase(
+    Uint8List jpgBytes,
+  ) async {
+    final supa = Supabase.instance.client;
+
+    // Ensure we have a user (anonymous is fine)
+    if (supa.auth.currentUser == null) {
+      await supa.auth.signInAnonymously();
+    }
+
+    final uid = supa.auth.currentUser?.id ?? 'anonymous';
+    final now = DateTime.now();
+    final date =
+        '${now.year.toString().padLeft(4, '0')}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    final ts = now.toIso8601String().replaceAll(':', '-');
+
+    // Path inside bucket "images"
+    final objectPath = '$uid/$date/snapshot_$ts.jpg';
+
+    // Upload
+    await supa.storage
+        .from('images')
+        .uploadBinary(
+          objectPath,
+          jpgBytes,
+          fileOptions: const FileOptions(
+            contentType: 'image/jpeg',
+            upsert: false,
+          ),
+        );
+
+    // Public (or signed) URL
+    final publicUrl = supa.storage.from('images').getPublicUrl(objectPath);
+
+    return SnapshotUploadResult(objectPath: objectPath, publicUrl: publicUrl);
+  }
+
+  Future<void> _insertDummyObjectUpdate({
+    required String objectId,
+    required String snapshotPath,
+    required String snapshotUrl,
+  }) async {
+    final supa = Supabase.instance.client;
+
+    // Example dummy values — replace with real ones from your tracker/GPS
+    final now = DateTime.now().toUtc(); // timestamptz with ms
+    final bboxTop = 0.10;
+    final bboxLeft = 0.20;
+    final bboxBottom = 0.55;
+    final bboxRight = 0.70;
+
+    final detectedClass = 'person';
+    final speedMps = 1.23;
+    final distanceM = 3.45;
+
+    // If you don't have GPS yet, you can null these or use a default
+    final latitude = 47.3769; // Zurich demo
+    final longitude = 8.5417;
+
+    await supa.from('object_updates').insert({
+      'object_id': objectId,
+      'timestamp': now.toIso8601String(), // or just pass DateTime.now().toUtc()
+      'bbox_top': bboxTop,
+      'bbox_left': bboxLeft,
+      'bbox_bottom': bboxBottom,
+      'bbox_right': bboxRight,
+      'class': detectedClass,
+      'speed_mps': speedMps,
+      'distance_m': distanceM,
+      'latitude': latitude,
+      'longitude': longitude,
+      'snapshot_path': snapshotPath, // e.g. <uid>/<date>/snapshot_...jpg
+      'snapshot_url': snapshotUrl, // optional convenience
+    });
   }
 
   Widget _playStopButton() {
