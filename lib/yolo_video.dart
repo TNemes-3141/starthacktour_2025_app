@@ -62,7 +62,7 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
 
     // Initialize the object tracker with tuned parameters
     _tracker = ObjectTracker(
-      maxFramesToDisappear: 10,  // More forgiving for brief occlusions
+      maxFramesToDisappear: 5,  // More forgiving for brief occlusions
       iouThreshold: 0.05,        // Stricter matching to prevent ID swaps
       minHitsToConfirm: 2,      // Requires 2 consecutive frames to show a box
     );
@@ -89,8 +89,8 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
       imageHeight: cameraImage.height,
       imageWidth: cameraImage.width,
       iouThreshold: 0.05,
-      confThreshold: 0.3,
-      classThreshold: 0.4,
+      confThreshold: 0.2,
+      classThreshold: 0.2,
     );
 
     if (!mounted) return;
@@ -138,7 +138,7 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
       _trackColors.clear();
       // Re-initialize the tracker to reset its state (e.g., nextId)
       _tracker = ObjectTracker(
-        maxFramesToDisappear: 10,
+        maxFramesToDisappear: 5,
         iouThreshold: 0.05,
         minHitsToConfirm: 2,
       );
@@ -305,7 +305,7 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
                 ),
               ),
               child: Text(
-                "${track.label} ID: ${track.id}",
+                "${track.label} ID: ${track.id} (${(track.score * 100).toStringAsFixed(0)}%)",
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 12,
