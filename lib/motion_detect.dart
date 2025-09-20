@@ -8,46 +8,40 @@ class MotionDetector {
     required this.srcHeight,
     this.smallW = 160,
     this.smallH = 90,
-    this.alphaBg = 0.12, // bg learning where mask==0
-    this.alphaFg = 0.02, // MUCH slower where mask==1 (prevents ghosting)
-    this.baseThresh = 22, // base intensity threshold
-    this.temporalN = 3, // history length
-    this.temporalVotes = 2, // majority votes required
-    this.minBlobArea = 30,
-    this.maxBlobs = 64,
-    this.morphIters = 1,
-  }) : _bg = Float32List(smallW * smallH),
-       _curr = Float32List(smallW * smallH),
-       _mask = Uint8List(smallW * smallH),
-       _maskStab = Uint8List(smallW * smallH),
-       _tmp = Uint8List(smallW * smallH),
-       _visited = Uint8List(smallW * smallH),
-       _hist = List.generate(5, (_) => Uint8List(smallW * smallH)); // ring > N
-
-  final double alphaBg, alphaFg;
-  final int baseThresh;
-  final int temporalN, temporalVotes;
-
-  final Uint8List _mask, _maskStab, _tmp, _visited;
-  final List<Uint8List> _hist;
-  int _histPtr = 0;
+    this.alpha = 0.1,        // background update rate
+    this.thresh = 25,        // intensity threshold on [0..255]
+    this.minBlobArea = 40,   // in downscaled pixels (e.g. 40 => ~ small blobs)
+    this.maxBlobs = 64,      // safety cap
+    this.morphIters = 1,     // 3x3 opening iterations
+  })  : _bg = Float32List(smallW * smallH),
+        _curr = Float32List(smallW * smallH),
+        _mask = Uint8List(smallW * smallH),
+        _tmp = Uint8List(smallW * smallH),
+        _visited = Uint8List(smallW * smallH);
 
   final int srcWidth, srcHeight;
   final int smallW, smallH;
+  final double alpha;
+  final int thresh;
   final int minBlobArea;
   final int maxBlobs;
   final int morphIters;
 
   final Float32List _bg;
   final Float32List _curr;
+  final Uint8List _mask;
+  final Uint8List _tmp;
+  final Uint8List _visited;
 
   bool _initialized = false;
 
   /// Process one frame’s Y plane (grayscale) and return detections in source coords.
   /// [yBytes] is the Y plane, [strideY] is bytesPerRow from CameraImage.
   List<Det> processYPlane(Uint8List yBytes, int strideY) {
+    // 1) Downsample Y to small grid (nearest-neighbor for speed)
     _downsampleY(yBytes, strideY);
 
+    // 2) Init background on first call
     if (!_initialized) {
       for (int i = 0; i < _bg.length; i++) {
         _bg[i] = _curr[i];
@@ -56,33 +50,33 @@ class MotionDetector {
       return const <Det>[];
     }
 
-    // 1) Diff + adaptive threshold → _mask
-    _makeForegroundMaskAdaptive();
+    // 3) Diff + threshold -> _mask
+    _makeForegroundMask();
 
-    // 2) Temporal majority voting over last N frames → _maskStab
-    _pushHistoryAndVote();
-
-    // 3) Morphological cleanup: CLOSE then OPEN (fills gaps, removes salt)
+    // 4) Morphological opening (erode then dilate) to clean noise
     for (int k = 0; k < morphIters; k++) {
-      _dilate3x3(_maskStab, _tmp);
-      _erode3x3(_tmp, _maskStab);
-    }
-    for (int k = 0; k < morphIters; k++) {
-      _erode3x3(_maskStab, _tmp);
-      _dilate3x3(_tmp, _maskStab);
+      _erode3x3(_mask, _tmp);
+      _dilate3x3(_tmp, _mask);
     }
 
-    // 4) Blobs from _maskStab
-    final rectsSmall = _findBlobsFrom(_maskStab);
+    // 5) Connected components → bounding boxes (in small space)
+    final rectsSmall = _findBlobs();
 
-    // 5) Selective background update (slow where fg)
-    _updateBackgroundSelective();
+    // 6) Update background (EMA)
+    for (int i = 0; i < _bg.length; i++) {
+      _bg[i] = (1.0 - alpha) * _bg[i] + alpha * _curr[i];
+    }
 
-    // 6) Scale up and return
-    final scaleX = srcWidth / smallW, scaleY = srcHeight / smallH;
+    // 7) Scale rects up to source coords
+    final scaleX = srcWidth / smallW;
+    final scaleY = srcHeight / smallH;
     final out = <Det>[];
     for (final r in rectsSmall) {
-      out.add(Det(r.x * scaleX, r.y * scaleY, r.w * scaleX, r.h * scaleY));
+      final x = r.x * scaleX;
+      final y = r.y * scaleY;
+      final w = r.w * scaleX;
+      final h = r.h * scaleY;
+      out.add(Det(x, y, w, h, score: 1.0));
       if (out.length >= maxBlobs) break;
     }
     return out;
@@ -107,30 +101,11 @@ class MotionDetector {
     }
   }
 
-  void _makeForegroundMaskAdaptive() {
-    // Compute absolute diff + robust threshold (base + k*MAD)
-    // Cheap MAD: median(|curr - bg|) approximated by percentile via histogram.
+  void _makeForegroundMask() {
     final n = _curr.length;
-    // build small histogram of diffs (0..255)
-    final hist = List<int>.filled(256, 0);
-    for (int i = 0; i < n; i++) {
-      final d = (_curr[i] - _bg[i]).abs().toInt().clamp(0, 255);
-      hist[d]++;
-    }
-    // 75th percentile for adaptivity
-    int cum = 0, p75 = 0, target = (n * 0.75).toInt();
-    for (int v = 0; v < 256; v++) {
-      cum += hist[v];
-      if (cum >= target) {
-        p75 = v;
-        break;
-      }
-    }
-    final thr = (baseThresh + (0.3 * p75)).clamp(8, 80).toInt();
-
     for (int i = 0; i < n; i++) {
       final d = (_curr[i] - _bg[i]).abs();
-      _mask[i] = (d >= thr) ? 255 : 0;
+      _mask[i] = (d >= thresh) ? 255 : 0;
     }
   }
 
@@ -184,39 +159,8 @@ class MotionDetector {
     }
   }
 
-  void _pushHistoryAndVote() {
-    // write current mask into ring buffer
-    final dst = _hist[_histPtr];
-    dst.setAll(0, _mask);
-    _histPtr = (_histPtr + 1) % _hist.length;
-
-    // vote over last temporalN buffers
-    final n = _curr.length;
-    _maskStab.fillRange(0, n, 0);
-    for (int i = 0; i < n; i++) {
-      int votes = 0;
-      for (int k = 0; k < temporalN; k++) {
-        final idx = (_histPtr - 1 - k);
-        final buf = _hist[(idx < 0 ? idx + _hist.length : idx)];
-        // treat 255 as 1 vote
-        votes += (buf[i] >= 128) ? 1 : 0;
-      }
-      _maskStab[i] = (votes >= temporalVotes) ? 255 : 0;
-    }
-  }
-
-  void _updateBackgroundSelective() {
-    final n = _bg.length;
-    for (int i = 0; i < n; i++) {
-      final a = (_maskStab[i] == 0)
-          ? alphaBg
-          : alphaFg; // slower where foreground
-      _bg[i] = (1.0 - a) * _bg[i] + a * _curr[i];
-    }
-  }
-
-  // Variants to use custom source masks
-  List<_RectI> _findBlobsFrom(Uint8List mask) {
+  List<_RectI> _findBlobs() {
+    // Flood-fill connected components on _mask (8-neighborhood)
     final w = smallW, h = smallH;
     _visited.fillRange(0, _visited.length, 0);
     final out = <_RectI>[];
@@ -226,37 +170,46 @@ class MotionDetector {
     for (int y = 0; y < h; y++) {
       for (int x = 0; x < w; x++) {
         final idx = y * w + x;
-        if (mask[idx] == 0 || _visited[idx] != 0) continue;
+        if (_mask[idx] == 0 || _visited[idx] != 0) continue;
 
+        // start flood
         int top = 0;
         stackX[top] = x;
         stackY[top] = y;
         top++;
         _visited[idx] = 1;
-        int minX = x, minY = y, maxX = x, maxY = y, area = 0;
+
+        int minX = x, minY = y, maxX = x, maxY = y;
+        int area = 0;
 
         while (top > 0) {
           top--;
-          final cx = stackX[top], cy = stackY[top];
+          final cx = stackX[top];
+          final cy = stackY[top];
           area++;
+
           if (cx < minX) minX = cx;
           if (cy < minY) minY = cy;
           if (cx > maxX) maxX = cx;
           if (cy > maxY) maxY = cy;
 
+          // 8 neighbors
           for (int ny = cy - 1; ny <= cy + 1; ny++) {
             if (ny < 0 || ny >= h) continue;
             for (int nx = cx - 1; nx <= cx + 1; nx++) {
               if (nx < 0 || nx >= w) continue;
               final nidx = ny * w + nx;
-              if (mask[nidx] == 0 || _visited[nidx] != 0) continue;
+              if (_mask[nidx] == 0 || _visited[nidx] != 0) continue;
               _visited[nidx] = 1;
               stackX[top] = nx;
               stackY[top] = ny;
               top++;
+              if (top >= stackX.length) break;
             }
           }
         }
+
+        // keep blobs over min area
         if (area >= minBlobArea) {
           out.add(_RectI(minX, minY, maxX - minX + 1, maxY - minY + 1));
           if (out.length >= maxBlobs) return out;
