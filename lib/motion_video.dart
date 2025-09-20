@@ -23,27 +23,45 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
   bool _busy = false;
   CameraImage? _lastImage;
 
-  // New: toggle for classification
+  // Detection controls
   bool _classificationEnabled = true;
+  bool _showDebugInfo = false;
 
-  // New: notification text (defaults as requested)
-  String _notificationText = 'No relevant objects';
+  // Enhanced notification system
+  String _notificationText = 'No motion detected';
+  Color _notificationColor = Colors.white;
 
-  // New: key to snapshot the preview + overlays
+  // Snapshot key
   final GlobalKey _previewKey = GlobalKey();
 
-  MotionDetector? _md; // <— add this
-  final int _frameSkip = 1; // process every frame; set to 2/3 if too slow
+  MotionDetector? _md;
+  final int _frameSkip = 1; // Process every frame for better responsiveness
   int _counter = 0;
 
-  // tracking
-  final _tracker = SortTracker(iouThreshold: 0.3, maxAge: 10, minHits: 2);
+  // Enhanced tracking with statistics
+  late SortTracker _tracker;
   List<Track> _tracks = [];
+  Map<String, dynamic> _trackerStats = {};
+
+  // Performance monitoring
+  DateTime? _lastFrameTime;
+  double _fps = 0.0;
+  int _processedFrames = 0;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    
+    // Initialize balanced tracker
+    _tracker = SortTracker(
+      iouThreshold: 0.20,      // Lower threshold for better matching
+      maxAge: 6,               // Moderate track lifetime
+      minHits: 2,              // Lower hit requirement
+      minDetectionScore: 0.3,  // Lower score threshold
+      maxTracksPerFrame: 20,
+    );
+    
     _init();
   }
 
@@ -67,49 +85,56 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
   Future<void> _start() async {
     if (_controller.value.isStreamingImages) return;
     _isDetecting = true;
+    _processedFrames = 0;
+    
     await _controller.startImageStream((image) async {
       if (!_isDetecting) return;
       _lastImage = image;
 
-      // Init detector on first frame (Dart-only)
+      // Initialize detector with balanced parameters
       _md ??= MotionDetector(
         srcWidth: image.width,
         srcHeight: image.height,
         smallW: 160,
         smallH: 90,
-        alphaBg: 0.12, // background update rate
-        alphaFg: 0.01, // slower bg update where foreground
-        baseThresh: 22, // base intensity threshold
-        temporalN: 4, // history length
-        temporalVotes: 3, // votes needed to accept pixel
-        minBlobArea: 50, // in downscaled pixels
-        morphIters: 1,
+        alphaBg: 0.10,           // Moderate background learning
+        alphaFg: 0.01,           // Slower where foreground detected
+        baseThresh: 27,          // Lower base threshold for sensitivity
+        temporalN: 6,            // Shorter temporal window
+        temporalVotes: 4,        // Fewer votes required
+        minBlobArea: 80,         // Smaller minimum blob
+        morphIters: 1,           // Less morphological cleanup
+        stabilityFrames: 15,     // Shorter stabilization period
+        motionThresholdArea: 100, // Lower motion threshold
+        aspectRatioFilter: false, // Disable for now
       );
 
       if (_busy) return;
-      // Optional frame skipping for speed
+      
+      // Frame skipping for performance
       _counter = (_counter + 1) % _frameSkip;
       if (_counter != 0) return;
 
       _busy = true;
+      final frameTime = DateTime.now();
+      
       try {
-        // Gate heavy processing behind the classification toggle if desired.
-        // If motion detection should always run, remove this 'if'.
         if (_classificationEnabled) {
           final dets = await _detectMotionDart(image);
           _tracks = _tracker.update(dets);
+          _trackerStats = _tracker.getStats();
 
-          // Example: update the notification text (customize as needed)
-          if (_tracks.isEmpty) {
-            _notificationText = 'No relevant objects';
-          } else {
-            _notificationText = 'Tracking ${_tracks.length} object(s)';
-          }
+          // Enhanced notification system
+          _updateNotificationText();
         } else {
-          // If classification is off, clear tracks (or keep last known – your call)
           _tracks = [];
-          _notificationText = 'Classification disabled';
+          _trackerStats = {};
+          _notificationText = 'Detection disabled';
+          _notificationColor = Colors.grey;
         }
+
+        // Update FPS calculation
+        _updateFPS(frameTime);
 
         if (mounted) setState(() {});
       } finally {
@@ -119,23 +144,68 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
     if (mounted) setState(() {});
   }
 
+  void _updateNotificationText() {
+    if (_tracks.isEmpty) {
+      _notificationText = 'No motion detected';
+      _notificationColor = Colors.white;
+    } else {
+      final activeCount = _tracks.length;
+      final avgSpeed = _tracks.isNotEmpty 
+          ? _tracks.map((t) => t.avgSpeed).reduce((a, b) => a + b) / _tracks.length
+          : 0.0;
+      
+      _notificationText = 'Tracking $activeCount object(s) - Avg speed: ${avgSpeed.toStringAsFixed(1)}px/frame';
+      
+      // Color based on activity level
+      if (avgSpeed > 5.0) {
+        _notificationColor = Colors.green;
+      } else if (avgSpeed > 2.0) {
+        _notificationColor = Colors.yellow;
+      } else {
+        _notificationColor = Colors.orange;
+      }
+    }
+  }
+
+  void _updateFPS(DateTime frameTime) {
+    _processedFrames++;
+    if (_lastFrameTime != null) {
+      final deltaMs = frameTime.difference(_lastFrameTime!).inMilliseconds;
+      if (deltaMs > 0) {
+        _fps = _fps * 0.9 + (1000.0 / deltaMs) * 0.1; // Smoothed FPS
+      }
+    }
+    _lastFrameTime = frameTime;
+  }
+
   Future<void> _stop() async {
     _isDetecting = false;
     if (_controller.value.isStreamingImages) {
       await _controller.stopImageStream();
     }
     _tracks = [];
+    _trackerStats = {};
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _reset() async {
+    _tracker.reset();
+    _md = null; // Force re-initialization
+    _tracks = [];
+    _trackerStats = {};
+    _processedFrames = 0;
+    _fps = 0.0;
+    _notificationText = 'Detection reset';
+    _notificationColor = Colors.blue;
     if (mounted) setState(() {});
   }
 
   Future<List<Det>> _detectMotionDart(CameraImage img) async {
-    // Use Y plane only
     final y = img.planes[0].bytes;
     final strideY = img.planes[0].bytesPerRow;
     return _md!.processYPlane(y, strideY);
   }
 
-  /// NEW: Snapshot the RepaintBoundary (camera + overlays) and save as PNG.
   Future<void> _takeSnapshot() async {
     try {
       final boundary =
@@ -153,36 +223,106 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
       final bytes = byteData.buffer.asUint8List();
       final dir = await getApplicationDocumentsDirectory();
       final ts = DateTime.now().toIso8601String().replaceAll(':', '-');
-      final file = File('${dir.path}/snapshot_$ts.png');
+      final file = File('${dir.path}/motion_snapshot_$ts.png');
       await file.writeAsBytes(bytes);
 
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Snapshot saved: ${file.path}')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Snapshot saved: ${file.path}'))
+      );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Snapshot failed: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Snapshot failed: $e'))
+      );
     }
   }
 
-  Widget _playStopButton() {
+  Widget _buildControlButtons() {
     return Positioned(
       bottom: 16,
       left: 16,
-      child: SizedBox(
-        height: 56,
-        width: 56,
-        child: ElevatedButton(
-          onPressed: _isDetecting ? _stop : _start,
-          style: ElevatedButton.styleFrom(
-            shape: const CircleBorder(),
-            padding: EdgeInsets.zero,
+      right: 16,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Main control row
+          Row(
+            children: [
+              // Play/Stop button
+              SizedBox(
+                height: 56,
+                width: 56,
+                child: ElevatedButton(
+                  onPressed: _isDetecting ? _stop : _start,
+                  style: ElevatedButton.styleFrom(
+                    shape: const CircleBorder(),
+                    padding: EdgeInsets.zero,
+                  ),
+                  child: Icon(_isDetecting ? Icons.stop : Icons.play_arrow),
+                ),
+              ),
+              const SizedBox(width: 12),
+              
+              // Reset button
+              SizedBox(
+                height: 56,
+                width: 56,
+                child: ElevatedButton(
+                  onPressed: _reset,
+                  style: ElevatedButton.styleFrom(
+                    shape: const CircleBorder(),
+                    padding: EdgeInsets.zero,
+                  ),
+                  child: const Icon(Icons.refresh),
+                ),
+              ),
+              const SizedBox(width: 12),
+              
+              // Snapshot button (expanded to fill remaining space)
+              Expanded(
+                child: SizedBox(
+                  height: 56,
+                  child: ElevatedButton.icon(
+                    onPressed: _takeSnapshot,
+                    icon: const Icon(Icons.camera_alt),
+                    label: const Text('Snapshot'),
+                  ),
+                ),
+              ),
+            ],
           ),
-          child: Icon(_isDetecting ? Icons.stop : Icons.play_arrow),
-        ),
+          
+          // Secondary controls
+          if (_showDebugInfo) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                children: [
+                  Text(
+                    'FPS: ${_fps.toStringAsFixed(1)} | Frames: $_processedFrames',
+                    style: const TextStyle(color: Colors.white, fontSize: 12),
+                  ),
+                  if (_trackerStats.isNotEmpty) ...[
+                    Text(
+                      'Active: ${_trackerStats['activeTracks']} | Total: ${_trackerStats['totalTracks']}',
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                    Text(
+                      'Confidence: ${(_trackerStats['avgConfidence'] * 100).toStringAsFixed(1)}%',
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }
@@ -190,8 +330,7 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
   Size _previewChildSize(BuildContext context) {
     final isPortrait =
         MediaQuery.of(context).orientation == Orientation.portrait;
-    final pv = _controller.value.previewSize!; // this is landscape w>h
-    // swap when in portrait so width < height
+    final pv = _controller.value.previewSize!;
     final previewW = isPortrait ? pv.height : pv.width;
     final previewH = isPortrait ? pv.width : pv.height;
     return Size(previewW, previewH);
@@ -238,17 +377,16 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
       return const Scaffold(body: Center(child: Text('Loading camera...')));
     }
 
-    // New layout: Column with (1) preview, (2) controls row, (3) bottom notification
     return Scaffold(
       backgroundColor: Colors.black,
       body: SafeArea(
         child: Column(
           children: [
-            // (1) Preview area with room beneath for controls/notification
+            // Preview area
             Expanded(
               child: Center(
                 child: FittedBox(
-                  fit: BoxFit.contain, // preserve aspect; no stretching
+                  fit: BoxFit.contain,
                   child: RepaintBoundary(
                     key: _previewKey,
                     child: Builder(
@@ -261,10 +399,8 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
                             fit: StackFit.expand,
                             children: [
                               CameraPreview(_controller),
-                              ..._boxes(
-                                childSize,
-                              ), // <-- pass the SAME childSize
-                              _playStopButton(),
+                              ..._boxes(childSize),
+                              _buildControlButtons(),
                             ],
                           ),
                         );
@@ -275,39 +411,40 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
               ),
             ),
 
-            // (2) Controls row
+            // Control panel
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
               child: Row(
                 children: [
-                  // Snapshot button
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      onPressed: _takeSnapshot,
-                      icon: const Icon(Icons.camera),
-                      label: const Text('Snapshot'),
-                      style: ElevatedButton.styleFrom(
-                        minimumSize: const Size.fromHeight(48),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  // Classification toggle
+                  // Detection toggle
                   Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       const Text(
-                        'Classification',
+                        'Detection',
                         style: TextStyle(color: Colors.white),
                       ),
                       const SizedBox(width: 8),
                       Switch(
                         value: _classificationEnabled,
-                        onChanged: (v) {
-                          setState(() => _classificationEnabled = v);
-                          // If disabling, you may also want to clear tracks:
-                          // setState(() { _tracks = []; _notificationText = 'Classification disabled'; });
-                        },
+                        onChanged: (v) => setState(() => _classificationEnabled = v),
+                      ),
+                    ],
+                  ),
+                  const Spacer(),
+                  
+                  // Debug info toggle
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text(
+                        'Debug',
+                        style: TextStyle(color: Colors.white),
+                      ),
+                      const SizedBox(width: 8),
+                      Switch(
+                        value: _showDebugInfo,
+                        onChanged: (v) => setState(() => _showDebugInfo = v),
                       ),
                     ],
                   ),
@@ -315,19 +452,19 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
               ),
             ),
 
-            // (3) Bottom notification window (reserved space with border)
+            // Status notification
             Container(
               width: double.infinity,
               padding: const EdgeInsets.all(12),
               margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
               decoration: BoxDecoration(
-                border: Border.all(color: Colors.white70),
+                border: Border.all(color: _notificationColor.withOpacity(0.7)),
                 borderRadius: BorderRadius.circular(12),
                 color: Colors.black.withOpacity(0.15),
               ),
               child: Text(
                 _notificationText,
-                style: const TextStyle(color: Colors.white),
+                style: TextStyle(color: _notificationColor),
               ),
             ),
           ],
@@ -339,13 +476,10 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
   Rect _mapImageRectToRender(Rect rImg, Size renderSize) {
     final imgW = _lastImage!.width.toDouble();
     final imgH = _lastImage!.height.toDouble();
-
-    // Most Android back cameras report 90 or 270
     final rotation = _controller.description.sensorOrientation;
 
     double rx, ry, rw, rh;
     if (rotation == 90) {
-      // rotate 90° CW: (x,y,w,h) -> (ih - (y+h), x, h, w)
       rx = imgH - (rImg.top + rImg.height);
       ry = rImg.left;
       rw = rImg.height;
@@ -355,7 +489,6 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
       final fy = renderSize.height / imgW;
       return Rect.fromLTWH(rx * fx, ry * fy, rw * fx, rh * fy);
     } else if (rotation == 270) {
-      // rotate 90° CCW: (x,y,w,h) -> (y, iw - (x+w), h, w)
       rx = rImg.top;
       ry = imgW - (rImg.left + rImg.width);
       rw = rImg.height;
@@ -365,7 +498,6 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
       final fy = renderSize.height / imgW;
       return Rect.fromLTWH(rx * fx, ry * fy, rw * fx, rh * fy);
     } else if (rotation == 0) {
-      // landscape, no rotation
       final fx = renderSize.width / imgW;
       final fy = renderSize.height / imgH;
       return Rect.fromLTWH(
@@ -375,8 +507,6 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
         rImg.height * fy,
       );
     } else {
-      // 180
-      // upside-down landscape
       final fx = renderSize.width / imgW;
       final fy = renderSize.height / imgH;
       rx = imgW - (rImg.left + rImg.width);
@@ -392,6 +522,18 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
       final rImg = Rect.fromLTWH(t.bbox[0], t.bbox[1], t.bbox[2], t.bbox[3]);
       final r = _mapImageRectToRender(rImg, renderSize);
 
+      // Color based on track confidence and motion
+      Color boxColor = Colors.lightGreenAccent;
+      if (t.confidence > 0.8) {
+        boxColor = Colors.green;
+      } else if (t.confidence < 0.5) {
+        boxColor = Colors.orange;
+      }
+      
+      if (t.isStationary) {
+        boxColor = Colors.blue; // Different color for stationary objects
+      }
+
       return Positioned(
         left: r.left,
         top: r.top,
@@ -399,25 +541,25 @@ class _MotionVideoState extends State<MotionVideo> with WidgetsBindingObserver {
         height: r.height,
         child: Container(
           decoration: BoxDecoration(
-            borderRadius: const BorderRadius.all(Radius.circular(10)),
-            border: Border.all(color: Colors.lightGreenAccent, width: 2),
+            borderRadius: const BorderRadius.all(Radius.circular(8)),
+            border: Border.all(color: boxColor, width: 2),
           ),
           child: Align(
             alignment: Alignment.topLeft,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              decoration: const BoxDecoration(
-                color: Color.fromARGB(200, 30, 30, 30),
-                borderRadius: BorderRadius.only(
-                  topLeft: Radius.circular(8),
-                  bottomRight: Radius.circular(8),
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+              decoration: BoxDecoration(
+                color: Colors.black87,
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(6),
+                  bottomRight: Radius.circular(6),
                 ),
               ),
               child: Text(
-                "Track #${t.id}",
+                "${t.id} (${(t.confidence * 100).toInt()}%)",
                 style: const TextStyle(
                   color: Colors.white,
-                  fontSize: 14,
+                  fontSize: 11,
                   fontWeight: FontWeight.bold,
                 ),
               ),
