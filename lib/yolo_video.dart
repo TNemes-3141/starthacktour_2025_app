@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_vision/flutter_vision.dart';
 
 import 'sort_tracker.dart';
+import 'coordinate_transformer.dart';
 
 class YoloVideo extends StatefulWidget {
   const YoloVideo({super.key});
@@ -28,6 +29,12 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
   // For assigning a unique and persistent color to each track ID
   final Map<int, Color> _trackColors = {};
   final Random _random = Random();
+
+  // Coordinate tracking properties (still calculated but not displayed)
+  final Map<int, ObjectCoordinates> _objectCoordinates = {};
+  final Map<int, double> _objectDistances = {}; // NEW: Store estimated distances
+  CameraConfig? _cameraConfig;
+  bool _showDistance = true; // Toggle for showing distance in UI
 
   // Model and label paths
   static const String _labelsAsset = 'assets/labels.txt';
@@ -67,8 +74,21 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
       minHitsToConfirm: 2,      // Requires 2 consecutive frames to show a box
     );
 
+    // Initialize camera configuration
+    _initCameraConfig();
+
     if (mounted) {
       setState(() => _isLoaded = true);
+    }
+  }
+
+  // Initialize camera config
+  void _initCameraConfig() {
+    try {
+      _cameraConfig = CoordinateTransformer.getCameraConfig();
+      print('Camera config loaded: ${_cameraConfig!.cameraLat}, ${_cameraConfig!.cameraLng}');
+    } catch (e) {
+      print('Failed to load camera config: $e');
     }
   }
 
@@ -80,6 +100,34 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
       numThreads: 2,
       useGpu: true,
     );
+  }
+
+  // Calculate coordinates and distances for all tracked objects
+  void _updateObjectCoordinatesAndDistances() {
+    if (_cameraConfig == null) return;
+    
+    _objectCoordinates.clear();
+    _objectDistances.clear();
+    
+    for (final track in _trackedObjects) {
+      try {
+        // Calculate distance using the new pinhole camera model
+        final distance = CoordinateTransformer.estimateDistance(
+          track.label, 
+          track.box, 
+          config: _cameraConfig,
+        );
+        _objectDistances[track.id] = distance;
+        
+        // Still calculate coordinates (needed for later use but not displayed)
+        final coordinates = track.calculateCoordinatesFromPixels(
+          config: _cameraConfig,
+        );
+        _objectCoordinates[track.id] = coordinates;
+      } catch (e) {
+        print('Error calculating coordinates/distance for track ${track.id}: $e');
+      }
+    }
   }
 
   /// Processes a single camera frame for object detection and tracking.
@@ -102,6 +150,9 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
     setState(() {
       _trackedObjects = _tracker.tracks;
     });
+
+    // Calculate coordinates and distances for all tracked objects
+    _updateObjectCoordinatesAndDistances();
   }
 
   Future<void> _startDetection() async {
@@ -136,6 +187,9 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
       _isDetecting = false;
       _trackedObjects.clear();
       _trackColors.clear();
+      // Clear coordinate and distance cache
+      _objectCoordinates.clear();
+      _objectDistances.clear();
       // Re-initialize the tracker to reset its state (e.g., nextId)
       _tracker = ObjectTracker(
         maxFramesToDisappear: 5,
@@ -161,6 +215,9 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
         await _controller.stopImageStream();
       }
       _trackedObjects.clear();
+      // Clear coordinate and distance cache
+      _objectCoordinates.clear();
+      _objectDistances.clear();
     } catch (_) {}
     await _controller.dispose();
     try {
@@ -197,6 +254,96 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
     }
   }
 
+  /// Gets a persistent color for a given track ID.
+  Color _getColorForTrack(int trackId) {
+    return _trackColors.putIfAbsent(trackId, () {
+      // Generate a random, bright color.
+      return Color.fromARGB(
+        255,
+        _random.nextInt(200) + 55,
+        _random.nextInt(200) + 55,
+        _random.nextInt(200) + 55,
+      );
+    });
+  }
+
+  // Get distance info for display
+  String _getDistanceInfo(Track track) {
+    final distance = _objectDistances[track.id];
+    if (distance == null || !_showDistance) return '';
+    
+    return '\nDist: ${distance.toStringAsFixed(1)}m';
+  }
+
+  // Print all coordinates and distances (useful for debugging/logging)
+  void _printAllCoordinatesAndDistances() {
+    print('\n=== Object Tracking Data ===');
+    for (final track in _trackedObjects) {
+      final coords = _objectCoordinates[track.id];
+      final distance = _objectDistances[track.id];
+      if (coords != null && distance != null) {
+        // Use display name for logging
+        final displayName = ObjectReferenceSizes.getDisplayName(track.label);
+        print('$displayName ID:${track.id} -> Distance: ${distance.toStringAsFixed(1)}m, $coords');
+      }
+    }
+    print('===========================\n');
+  }
+
+  /// Displays the bounding boxes for all tracked objects.
+  List<Widget> _displayTrackedBoxes(Size screen) {
+    if (_trackedObjects.isEmpty || _lastCameraImage == null) return [];
+
+    final factorX = screen.width / _lastCameraImage!.height;
+    final factorY = screen.height / _lastCameraImage!.width;
+
+    return _trackedObjects.map((track) {
+      final box = track.box;
+      final color = _getColorForTrack(track.id);
+      // Include distance info if enabled
+      final distanceInfo = _getDistanceInfo(track);
+      // Get display name for UI
+      final displayName = ObjectReferenceSizes.getDisplayName(track.label);
+
+      return Positioned(
+        left: box[0] * factorX,
+        top: box[1] * factorY,
+        width: (box[2] - box[0]) * factorX,
+        height: (box[3] - box[1]) * factorY,
+        child: Container(
+          decoration: BoxDecoration(
+            borderRadius: const BorderRadius.all(Radius.circular(8)),
+            border: Border.all(color: color, width: 2.5),
+          ),
+          child: Align(
+            alignment: Alignment.topLeft,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+              decoration: BoxDecoration(
+                color: color,
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(6),
+                  bottomRight: Radius.circular(6),
+                ),
+              ),
+              child: Text(
+                "$displayName ID: ${track.id} (${(track.score * 100).toStringAsFixed(0)}%)$distanceInfo",
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 11, // Slightly larger since we have less text
+                  fontWeight: FontWeight.bold,
+                  shadows: [
+                    Shadow(color: Colors.black, blurRadius: 4, offset: Offset(1,1))
+                  ]
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }).toList();
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_isLoaded) {
@@ -219,6 +366,34 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
             const Center(child: CircularProgressIndicator()),
           
           ..._displayTrackedBoxes(size),
+
+          // Distance toggle button (replaces coordinate toggle)
+          Positioned(
+            top: 50,
+            right: 20,
+            child: FloatingActionButton(
+              mini: true,
+              backgroundColor: _showDistance ? Colors.blue : Colors.grey,
+              onPressed: () {
+                setState(() {
+                  _showDistance = !_showDistance;
+                });
+              },
+              child: const Icon(Icons.straighten, color: Colors.white),
+            ),
+          ),
+
+          // Print coordinates and distances button (for debugging)
+          Positioned(
+            top: 100,
+            right: 20,
+            child: FloatingActionButton(
+              mini: true,
+              backgroundColor: Colors.green,
+              onPressed: _printAllCoordinatesAndDistances,
+              child: const Icon(Icons.print, color: Colors.white),
+            ),
+          ),
 
           Positioned(
             bottom: 48,
@@ -257,68 +432,5 @@ class _YoloVideoState extends State<YoloVideo> with WidgetsBindingObserver {
         ],
       ),
     );
-  }
-
-  /// Gets a persistent color for a given track ID.
-  Color _getColorForTrack(int trackId) {
-    return _trackColors.putIfAbsent(trackId, () {
-      // Generate a random, bright color.
-      return Color.fromARGB(
-        255,
-        _random.nextInt(200) + 55,
-        _random.nextInt(200) + 55,
-        _random.nextInt(200) + 55,
-      );
-    });
-  }
-
-  /// Displays the bounding boxes for all tracked objects.
-  List<Widget> _displayTrackedBoxes(Size screen) {
-    if (_trackedObjects.isEmpty || _lastCameraImage == null) return [];
-
-    final factorX = screen.width / _lastCameraImage!.height;
-    final factorY = screen.height / _lastCameraImage!.width;
-
-    return _trackedObjects.map((track) {
-      final box = track.box;
-      final color = _getColorForTrack(track.id);
-
-      return Positioned(
-        left: box[0] * factorX,
-        top: box[1] * factorY,
-        width: (box[2] - box[0]) * factorX,
-        height: (box[3] - box[1]) * factorY,
-        child: Container(
-          decoration: BoxDecoration(
-            borderRadius: const BorderRadius.all(Radius.circular(8)),
-            border: Border.all(color: color, width: 2.5),
-          ),
-          child: Align(
-            alignment: Alignment.topLeft,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-              decoration: BoxDecoration(
-                color: color,
-                borderRadius: const BorderRadius.only(
-                  topLeft: Radius.circular(6),
-                  bottomRight: Radius.circular(6),
-                ),
-              ),
-              child: Text(
-                "${track.label} ID: ${track.id} (${(track.score * 100).toStringAsFixed(0)}%)",
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 12,
-                  fontWeight: FontWeight.bold,
-                  shadows: [
-                    Shadow(color: Colors.black, blurRadius: 4, offset: Offset(1,1))
-                  ]
-                ),
-              ),
-            ),
-          ),
-        ),
-      );
-    }).toList();
   }
 }
