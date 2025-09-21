@@ -39,6 +39,7 @@ dependencies:
   collection: ^1.18.0
   path_provider: ^2.1.4
   supabase_flutter: ^2.6.0
+  image: ^4.2.0
 
 dev_dependencies:
   flutter_test:

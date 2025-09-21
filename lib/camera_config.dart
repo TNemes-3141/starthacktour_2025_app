@@ -12,13 +12,13 @@ class CameraConstants {
   static const double diagonalHalfFovDeg = 39.7622;
   
   // Camera GPS position
-  static const double cameraLatitude = 47.420345;
-  static const double cameraLongitude = 9.370128;
+  static const double cameraLatitude = 47.30658844506907;
+  static const double cameraLongitude = 9.431777965149525;
   
   // Camera orientation
   /// Direction the camera is pointing, in degrees azimuth:
   /// 0 = North, 90 = East, 180 = South, 270 = West
-  static const double cameraAzimuthDeg = 150;
+  static const double cameraAzimuthDeg = 225;
   
   /// Elevation angle above the horizontal plane:
   /// 0° = looking along the horizon, 90° = straight up
