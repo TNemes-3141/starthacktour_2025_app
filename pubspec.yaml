@@ -39,6 +39,7 @@ dependencies:
   collection: ^1.18.0
   path_provider: ^2.1.4
   supabase_flutter: ^2.6.0
+  image: ^4.2.0
 
 dev_dependencies:
   flutter_test:
@@ -69,7 +70,9 @@ flutter:
 
   # For details regarding adding assets from package dependencies, see
   # https://flutter.dev/to/asset-from-package
-
+  assets:
+    - assets/labels.txt
+    - assets/yolov8n_float32.tflite
   # To add custom fonts to your application, add a fonts section here,
   # in this "flutter" section. Each entry in this list should have a
   # "family" key with the font family name, and a "fonts" key with a
